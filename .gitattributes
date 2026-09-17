@@ -1,0 +1,5 @@
+# Shell scripts must keep LF endings: a CRLF shebang makes Linux fail with
+# "bad interpreter: /usr/bin/env bash^M". This overrides core.autocrlf in
+# any clone, including Windows machines where autocrlf=true is the default.
+*.sh text eol=lf
+.gitattributes text eol=lf
