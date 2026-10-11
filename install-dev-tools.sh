@@ -12,10 +12,13 @@
 #   - Claude Code config (claude-config), from the claude/ folder next to
 #     this script:
 #       CLAUDE.md         copied into ~/.claude
+#       statusline-command.sh
+#                         copied into ~/.claude (settings.json's statusLine
+#                         runs it)
 #       settings.json     merged into ~/.claude/settings.json: repo values win,
 #                         keys Claude Code wrote itself (marketplaces, enabled
 #                         plugins) are kept
-#                         (either file is backed up first if it would change)
+#                         (any of these is backed up first if it would change)
 #       marketplaces.txt  plugin marketplace sources to add (owner/repo or URL)
 #       plugins.txt       plugin@marketplace ids to install
 #       mcp-servers.json  {"name": {server config}} added at user scope
@@ -237,12 +240,12 @@ put_config_file() {
   ok "updated ${dest/#$HOME/\~}"
 }
 
-copy_claude_md() {
-  local src="${CLAUDE_SRC}/CLAUDE.md" dest="${HOME}/.claude/CLAUDE.md"
+# Copy claude/<name> to ~/.claude/<name> as-is.
+copy_claude_file() {
+  local src="${CLAUDE_SRC}/$1" dest="${HOME}/.claude/$1"
   [[ -f "$src" ]] || return 0
   if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then
-    # shellcheck disable=SC2088  # display text, not a path
-    ok "~/.claude/CLAUDE.md already matches the repo — skipping"
+    ok "${dest/#$HOME/\~} already matches the repo — skipping"
     return 0
   fi
   put_config_file "$src" "$dest"
@@ -292,7 +295,8 @@ install_claude_config() {
   log "Applying Claude Code config from ${CLAUDE_SRC}"
   apt_install jq
 
-  copy_claude_md
+  copy_claude_file CLAUDE.md
+  copy_claude_file statusline-command.sh
   merge_settings
 
   # Adding a marketplace that is already present is a no-op, so no check here.
