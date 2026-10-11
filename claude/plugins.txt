@@ -1,0 +1,2 @@
+# Claude Code plugins to install at user scope, one plugin@marketplace per line.
+mattpocock-skills@claude-plugins-official

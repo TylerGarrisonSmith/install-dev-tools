@@ -4,11 +4,18 @@
 #
 # Installs on Ubuntu (20.04+ / Debian-based):
 #   - git
-#   - Node.js (NodeSource LTS)
+#   - Node.js (NodeSource, newest major by default)
 #   - GitHub CLI (gh)
 #   - Google Cloud CLI (gcloud)
 #   - uv (Astral Python package manager)
 #   - Claude Code CLI (claude)
+#   - Claude Code config (claude-config), from the claude/ folder next to
+#     this script:
+#       CLAUDE.md, settings.json  copied into ~/.claude (existing files that
+#                                 differ are backed up first)
+#       plugins.txt               plugin@marketplace ids to install
+#       mcp-servers.json          {"name": {server config}} added at user scope
+#     Any of these may be absent; missing ones are skipped.
 #
 # Usage:
 #   ./install-dev-tools.sh                  # install everything
@@ -17,7 +24,7 @@
 #   ./install-dev-tools.sh --list           # show available components
 #
 # Pinning (set these to make rebuilds reproducible):
-#   NODE_MAJOR=24        Node.js major version
+#   NODE_MAJOR=24        Node.js major version, or "latest"
 #   UV_VERSION=0.9.2     exact uv version, or "latest"
 #   CLAUDE_CHANNEL=stable  "stable", "latest", or an exact version
 #
@@ -29,17 +36,18 @@
 
 set -euo pipefail
 
-NODE_MAJOR="${NODE_MAJOR:-24}"          # Node.js 24 "Krypton" is the active LTS line
+NODE_MAJOR="${NODE_MAJOR:-latest}"      # major version number, or "latest"
 UV_VERSION="${UV_VERSION:-latest}"      # exact version, or "latest"
-CLAUDE_CHANNEL="${CLAUDE_CHANNEL:-stable}"  # stable | latest | exact version
+CLAUDE_CHANNEL="${CLAUDE_CHANNEL:-latest}"  # stable | latest | exact version
 
 KEYRINGS_DIR="/etc/apt/keyrings"
 LOCAL_BIN="${HOME}/.local/bin"
 VERSION_RECORD="${HOME}/.dev-tools-versions"
+CLAUDE_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/claude"
 FORCE=0
 APT_UPDATED=0
 
-ALL_COMPONENTS=(git node gh gcloud uv claude)
+ALL_COMPONENTS=(git node gh gcloud uv claude claude-config)
 
 # Single scratch dir, removed on any exit path.
 WORKDIR="$(mktemp -d)"
@@ -54,7 +62,13 @@ ok()    { printf '%s  ok%s %s\n' "$GREEN"  "$RESET" "$*"; }
 warn()  { printf '%swarn%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
 die()   { printf '%serr %s %s\n' "$RED"    "$RESET" "$*" >&2; exit 1; }
 
-have() { command -v "$1" >/dev/null 2>&1; }
+# Under WSL the Windows PATH is appended by default, so a Windows tool (e.g. a
+# scoop "gcloud" shim under /mnt/c) would otherwise count as installed.
+have() {
+  local path
+  path="$(command -v "$1" 2>/dev/null)" || return 1
+  [[ "$path" != /mnt/* ]]
+}
 
 # Install a component only if its binary is missing (or --force was passed).
 needs() {
@@ -112,21 +126,37 @@ install_git() {
   apt_install git
 }
 
+# Newest Node.js major version, from the official release index (newest first).
+latest_node_major() {
+  local index="${WORKDIR}/node-index.json" major
+  curl -fsSL https://nodejs.org/dist/index.json -o "$index" \
+    || die "could not download the Node.js release index"
+  # sed -n reads all its input, so nothing upstream gets SIGPIPE under pipefail.
+  major="$(grep -o '"version":"v[0-9]*' "$index" | sed -n '1s/.*v//p')"
+  [[ -n "$major" ]] || die "could not find a version in the Node.js release index"
+  printf '%s\n' "$major"
+}
+
 install_node() {
+  local major="$NODE_MAJOR"
+  [[ "$major" == "latest" ]] && major="$(latest_node_major)"
+
   # Bare presence is not enough here: Ubuntu's own nodejs package is often
   # several majors behind, and a presence-only check would silently leave it.
   if have node && [[ $FORCE -eq 0 ]]; then
     local current
     current="$(node -v 2>/dev/null | sed 's/^v//; s/\..*//')"
-    if [[ "$current" == "$NODE_MAJOR" ]]; then
+    if [[ "$current" == "$major" ]]; then
       ok "node ${current}.x already installed — skipping"
       return 0
     fi
-    warn "node ${current}.x present but ${NODE_MAJOR}.x requested — upgrading"
+    warn "node ${current}.x present but ${major}.x requested — upgrading"
   fi
 
-  log "Installing Node.js ${NODE_MAJOR}.x from NodeSource"
-  curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | sudo -E bash -
+  log "Installing Node.js ${major}.x from NodeSource"
+  # NodeSource can lag a few days behind a brand-new major release.
+  curl -fsSL "https://deb.nodesource.com/setup_${major}.x" | sudo -E bash - \
+    || die "NodeSource setup for Node ${major}.x failed (new release not packaged yet?) — try NODE_MAJOR=$((major - 1))"
   APT_UPDATED=1   # the NodeSource script runs apt-get update itself
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs
 }
@@ -185,6 +215,66 @@ install_claude() {
   # Note the pin is soft — Claude Code auto-updates in the background, so
   # this fixes the starting point, not the version you'll be on next week.
   curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_CHANNEL"
+}
+
+# Copy one file from the repo into place. The repo copy wins; a differing
+# existing file is backed up rather than lost.
+copy_config_file() {
+  local src="$1" dest="$2"
+  [[ -f "$src" ]] || return 0
+  if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then
+    ok "${dest/#$HOME/\~} already matches the repo — skipping"
+    return 0
+  fi
+  if [[ -e "$dest" ]]; then
+    local backup
+    backup="${dest}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -p "$dest" "$backup"
+    warn "${dest/#$HOME/\~} differs from the repo — old copy saved as ${backup/#$HOME/\~}"
+  fi
+  install -D -m 0644 "$src" "$dest"
+  ok "copied ${src##*/} to ${dest/#$HOME/\~}"
+}
+
+install_claude_config() {
+  # claude may have been installed moments ago, before ~/.local/bin is on PATH.
+  local claude_bin="${LOCAL_BIN}/claude"
+  have claude && claude_bin="$(command -v claude)"
+  [[ -x "$claude_bin" ]] || die "claude-config needs Claude Code — install the 'claude' component first"
+
+  [[ -d "$CLAUDE_SRC" ]] || { warn "no claude/ folder next to this script — skipping claude-config"; return 0; }
+  log "Applying Claude Code config from ${CLAUDE_SRC}"
+  apt_install jq
+
+  copy_config_file "${CLAUDE_SRC}/CLAUDE.md"     "${HOME}/.claude/CLAUDE.md"
+  copy_config_file "${CLAUDE_SRC}/settings.json" "${HOME}/.claude/settings.json"
+
+  local id installed
+  if [[ -f "${CLAUDE_SRC}/plugins.txt" ]]; then
+    installed="$("$claude_bin" plugin list --json | jq -r '.[].id')"
+    # Strip comments and whitespace; skip blank lines.
+    while read -r id; do
+      [[ -n "$id" ]] || continue
+      if grep -qxF "$id" <<<"$installed"; then
+        ok "plugin $id already installed — skipping"
+      else
+        "$claude_bin" plugin install --scope user "$id" </dev/null
+      fi
+    done < <(sed 's/#.*//; s/[[:space:]]//g' "${CLAUDE_SRC}/plugins.txt")
+  fi
+
+  local name servers="${CLAUDE_SRC}/mcp-servers.json"
+  if [[ -f "$servers" ]]; then
+    jq -e 'type == "object"' "$servers" >/dev/null || die "$servers must be a JSON object of {name: server config}"
+    while read -r name; do
+      # </dev/null: claude must not eat the rest of this loop's input.
+      if "$claude_bin" mcp get "$name" </dev/null >/dev/null 2>&1; then
+        ok "MCP server $name already configured — skipping"
+      else
+        "$claude_bin" mcp add-json --scope user "$name" "$(jq -c --arg n "$name" '.[$n]' "$servers")" </dev/null
+      fi
+    done < <(jq -r 'keys[]' "$servers")
+  fi
 }
 
 ensure_path() {
@@ -251,6 +341,7 @@ main() {
       gcloud|google-cloud-cli) install_gcloud ;;
       uv)     install_uv ;;
       claude|claude-code) install_claude ;;
+      claude-config) install_claude_config ;;
       *)      die "unknown component: $c (try --list)" ;;
     esac
   done
@@ -263,7 +354,8 @@ main() {
 Next steps (each needs an interactive login):
   gh auth login
   gcloud init
-  claude            # first run opens a browser to sign in
+  claude            # first run opens a browser to sign in;
+                    # then /mcp to sign in to MCP servers (e.g. Notion)
 
 Open a new shell (or: source ~/.bashrc) so PATH changes take effect.
 EOF
