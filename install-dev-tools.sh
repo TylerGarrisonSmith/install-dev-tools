@@ -89,9 +89,21 @@ needs() {
   return 0
 }
 
+# Ubuntu's automatic updates (unattended-upgrades) hold the dpkg lock for a
+# few minutes after the machine or WSL distro starts. apt-get fails at once on
+# a held lock unless told to wait, and -qq hides the wait, so say why it's slow.
+APT_WAIT=(-o DPkg::Lock::Timeout=600)
+
+apt_wait_notice() {
+  pgrep -f /usr/bin/unattended-upgrade >/dev/null \
+    && log "Ubuntu's automatic updates are running — waiting for them to finish (up to 10 min)"
+  return 0
+}
+
 apt_update_once() {
   if [[ $APT_UPDATED -eq 0 ]]; then
-    sudo apt-get update -qq
+    apt_wait_notice
+    sudo apt-get update -qq "${APT_WAIT[@]}"
     APT_UPDATED=1
   fi
 }
@@ -102,7 +114,8 @@ apt_install() {
   # Without --reinstall, apt is a no-op on an already-installed package,
   # so --force would silently do nothing for the apt-based tools.
   [[ $FORCE -eq 1 ]] && extra+=(--reinstall)
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${extra[@]+"${extra[@]}"}" "$@"
+  apt_wait_notice
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${APT_WAIT[@]}" "${extra[@]+"${extra[@]}"}" "$@"
 }
 
 # Fetch an armored key, verify it is real OpenPGP data, and dearmor it.
@@ -167,7 +180,7 @@ install_node() {
   curl -fsSL "https://deb.nodesource.com/setup_${major}.x" | sudo -E bash - \
     || die "NodeSource setup for Node ${major}.x failed (new release not packaged yet?) — try NODE_MAJOR=$((major - 1))"
   APT_UPDATED=1   # the NodeSource script runs apt-get update itself
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${APT_WAIT[@]}" nodejs
 }
 
 install_gh() {
