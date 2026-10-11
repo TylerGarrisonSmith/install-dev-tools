@@ -23,6 +23,8 @@
 #       plugins.txt       plugin@marketplace ids to install
 #       mcp-servers.json  {"name": {server config}} added at user scope
 #     Any of these may be absent; missing ones are skipped.
+#   - Windows Terminal key binding (windows-terminal), WSL only: makes
+#     Ctrl+Backspace delete the previous word. Skipped on non-WSL machines.
 #
 # Usage:
 #   ./install-dev-tools.sh                  # install everything
@@ -56,7 +58,7 @@ APT_UPDATED=0
 CONFIG_FAILURES=0
 LOCAL_BIN_WAS_ON_PATH=0
 
-ALL_COMPONENTS=(git node gh gcloud uv claude claude-config)
+ALL_COMPONENTS=(git node gh gcloud uv claude claude-config windows-terminal)
 
 # Single scratch dir, removed on any exit path.
 WORKDIR="$(mktemp -d)"
@@ -342,6 +344,48 @@ install_claude_config() {
 }
 
 # PATH for this run is set up front in main(); this only persists it.
+# Windows Terminal sends Ctrl+Backspace as a plain backspace, so it deletes one
+# character in bash and Claude Code. Bind it to Ctrl+W (delete word) instead.
+# The settings file lives on the Windows side, so this only applies under WSL.
+install_windows_terminal() {
+  if ! grep -qi microsoft /proc/version 2>/dev/null || ! have cmd.exe || ! have wslpath; then
+    ok "not running under WSL — skipping windows-terminal"
+    return 0
+  fi
+  apt_install jq
+
+  local localappdata
+  # cd to a Windows path first: cmd.exe complains when started from a WSL path.
+  localappdata="$(cd /mnt/c && cmd.exe /c 'echo %LOCALAPPDATA%' 2>/dev/null | tr -d '\r')"
+  [[ -n "$localappdata" ]] || { warn "could not find the Windows LOCALAPPDATA folder — skipping windows-terminal"; return 0; }
+  localappdata="$(wslpath -u "$localappdata")"
+
+  local dest="" candidate
+  for candidate in \
+    "${localappdata}/Packages/Microsoft.WindowsTerminal_8wekyb3d8bbwe/LocalState/settings.json" \
+    "${localappdata}/Packages/Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe/LocalState/settings.json" \
+    "${localappdata}/Microsoft/Windows Terminal/settings.json"; do
+    [[ -f "$candidate" ]] && { dest="$candidate"; break; }
+  done
+  [[ -n "$dest" ]] || { warn "Windows Terminal settings.json not found — skipping windows-terminal"; return 0; }
+
+  if jq -e '.keybindings // [] | any(.keys == "ctrl+backspace")' "$dest" >/dev/null 2>&1; then
+    ok "Windows Terminal already binds Ctrl+Backspace — skipping"
+    return 0
+  fi
+
+  local merged="${WORKDIR}/wt-settings.json"
+  # Fails if the file has comments (jq reads strict JSON); leave it untouched then.
+  if ! jq '
+      .actions = (.actions // []) + [{command: {action: "sendInput", input: "\u0017"}, id: "User.deleteWord"}]
+      | .keybindings = (.keybindings // []) + [{id: "User.deleteWord", keys: "ctrl+backspace"}]
+    ' "$dest" > "$merged" 2>/dev/null; then
+    warn "could not parse Windows Terminal settings.json (comments in it?) — add Ctrl+Backspace manually"
+    return 0
+  fi
+  put_config_file "$merged" "$dest"
+}
+
 ensure_path() {
   [[ -d "$LOCAL_BIN" && $LOCAL_BIN_WAS_ON_PATH -eq 0 ]] || return 0
 
@@ -411,6 +455,7 @@ main() {
       uv)     install_uv ;;
       claude|claude-code) install_claude ;;
       claude-config) install_claude_config ;;
+      windows-terminal) install_windows_terminal ;;
       *)      die "unknown component: $c (try --list)" ;;
     esac
   done
