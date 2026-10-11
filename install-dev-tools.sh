@@ -11,10 +11,14 @@
 #   - Claude Code CLI (claude)
 #   - Claude Code config (claude-config), from the claude/ folder next to
 #     this script:
-#       CLAUDE.md, settings.json  copied into ~/.claude (existing files that
-#                                 differ are backed up first)
-#       plugins.txt               plugin@marketplace ids to install
-#       mcp-servers.json          {"name": {server config}} added at user scope
+#       CLAUDE.md         copied into ~/.claude
+#       settings.json     merged into ~/.claude/settings.json: repo values win,
+#                         keys Claude Code wrote itself (marketplaces, enabled
+#                         plugins) are kept
+#                         (either file is backed up first if it would change)
+#       marketplaces.txt  plugin marketplace sources to add (owner/repo or URL)
+#       plugins.txt       plugin@marketplace ids to install
+#       mcp-servers.json  {"name": {server config}} added at user scope
 #     Any of these may be absent; missing ones are skipped.
 #
 # Usage:
@@ -46,6 +50,8 @@ VERSION_RECORD="${HOME}/.dev-tools-versions"
 CLAUDE_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/claude"
 FORCE=0
 APT_UPDATED=0
+CONFIG_FAILURES=0
+LOCAL_BIN_WAS_ON_PATH=0
 
 ALL_COMPONENTS=(git node gh gcloud uv claude claude-config)
 
@@ -217,71 +223,110 @@ install_claude() {
   curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_CHANNEL"
 }
 
-# Copy one file from the repo into place. The repo copy wins; a differing
-# existing file is backed up rather than lost.
-copy_config_file() {
-  local src="$1" dest="$2"
-  [[ -f "$src" ]] || return 0
-  if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then
-    ok "${dest/#$HOME/\~} already matches the repo — skipping"
-    return 0
-  fi
+# Put new config content in place. The repo version wins, but a file that
+# would change is backed up first rather than lost.
+put_config_file() {
+  local new="$1" dest="$2"
   if [[ -e "$dest" ]]; then
     local backup
     backup="${dest}.bak.$(date +%Y%m%d%H%M%S)"
     cp -p "$dest" "$backup"
-    warn "${dest/#$HOME/\~} differs from the repo — old copy saved as ${backup/#$HOME/\~}"
+    warn "${dest/#$HOME/\~} changed — old copy saved as ${backup/#$HOME/\~}"
   fi
-  install -D -m 0644 "$src" "$dest"
-  ok "copied ${src##*/} to ${dest/#$HOME/\~}"
+  install -D -m 0644 "$new" "$dest"
+  ok "updated ${dest/#$HOME/\~}"
+}
+
+copy_claude_md() {
+  local src="${CLAUDE_SRC}/CLAUDE.md" dest="${HOME}/.claude/CLAUDE.md"
+  [[ -f "$src" ]] || return 0
+  if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then
+    # shellcheck disable=SC2088  # display text, not a path
+    ok "~/.claude/CLAUDE.md already matches the repo — skipping"
+    return 0
+  fi
+  put_config_file "$src" "$dest"
+}
+
+# Claude Code writes to settings.json itself (marketplaces, enabled plugins),
+# so a plain copy would wipe those and then differ again on every run.
+# Deep-merge instead: repo values win, keys only present locally survive.
+merge_settings() {
+  local src="${CLAUDE_SRC}/settings.json" dest="${HOME}/.claude/settings.json"
+  local merged="${WORKDIR}/settings.json"
+  [[ -f "$src" ]] || return 0
+  jq -e 'type == "object"' "$src" >/dev/null || die "$src must be a JSON object"
+  if [[ -f "$dest" ]]; then
+    jq -s '.[0] * .[1]' "$dest" "$src" > "$merged" \
+      || die "could not merge into ~/.claude/settings.json (is it valid JSON?)"
+    # Compare as JSON, so key order and whitespace alone don't count as a change.
+    if jq -en --slurpfile a "$dest" --slurpfile b "$merged" '$a == $b' >/dev/null; then
+      # shellcheck disable=SC2088  # display text, not a path
+      ok "~/.claude/settings.json already has the repo settings — skipping"
+      return 0
+    fi
+  else
+    jq . "$src" > "$merged"
+  fi
+  put_config_file "$merged" "$dest"
+}
+
+# A failed plugin or MCP step shouldn't block the rest; it is counted and
+# reported at the end, and the script exits non-zero.
+config_step() {
+  # </dev/null: claude must not eat the input of the loop calling this.
+  "$@" </dev/null && return 0
+  warn "failed: $*"
+  CONFIG_FAILURES=$((CONFIG_FAILURES + 1))
+}
+
+# Non-comment, non-blank lines of a list file, whitespace stripped.
+list_entries() {
+  [[ -f "$1" ]] || return 0
+  sed 's/#.*//; s/[[:space:]]//g; /^$/d' "$1"
 }
 
 install_claude_config() {
-  # claude may have been installed moments ago, before ~/.local/bin is on PATH.
-  local claude_bin="${LOCAL_BIN}/claude"
-  have claude && claude_bin="$(command -v claude)"
-  [[ -x "$claude_bin" ]] || die "claude-config needs Claude Code — install the 'claude' component first"
-
+  have claude || die "claude-config needs Claude Code — install the 'claude' component first"
   [[ -d "$CLAUDE_SRC" ]] || { warn "no claude/ folder next to this script — skipping claude-config"; return 0; }
   log "Applying Claude Code config from ${CLAUDE_SRC}"
   apt_install jq
 
-  copy_config_file "${CLAUDE_SRC}/CLAUDE.md"     "${HOME}/.claude/CLAUDE.md"
-  copy_config_file "${CLAUDE_SRC}/settings.json" "${HOME}/.claude/settings.json"
+  copy_claude_md
+  merge_settings
+
+  # Adding a marketplace that is already present is a no-op, so no check here.
+  local source
+  while read -r source; do
+    config_step claude plugin marketplace add "$source"
+  done < <(list_entries "${CLAUDE_SRC}/marketplaces.txt")
 
   local id installed
-  if [[ -f "${CLAUDE_SRC}/plugins.txt" ]]; then
-    installed="$("$claude_bin" plugin list --json | jq -r '.[].id')"
-    # Strip comments and whitespace; skip blank lines.
-    while read -r id; do
-      [[ -n "$id" ]] || continue
-      if grep -qxF "$id" <<<"$installed"; then
-        ok "plugin $id already installed — skipping"
-      else
-        "$claude_bin" plugin install --scope user "$id" </dev/null
-      fi
-    done < <(sed 's/#.*//; s/[[:space:]]//g' "${CLAUDE_SRC}/plugins.txt")
-  fi
+  installed="$(claude plugin list --json </dev/null | jq -r '.[].id')"
+  while read -r id; do
+    if grep -qxF "$id" <<<"$installed"; then
+      ok "plugin $id already installed — skipping"
+    else
+      config_step claude plugin install --scope user "$id"
+    fi
+  done < <(list_entries "${CLAUDE_SRC}/plugins.txt")
 
   local name servers="${CLAUDE_SRC}/mcp-servers.json"
   if [[ -f "$servers" ]]; then
     jq -e 'type == "object"' "$servers" >/dev/null || die "$servers must be a JSON object of {name: server config}"
     while read -r name; do
-      # </dev/null: claude must not eat the rest of this loop's input.
-      if "$claude_bin" mcp get "$name" </dev/null >/dev/null 2>&1; then
+      if claude mcp get "$name" </dev/null >/dev/null 2>&1; then
         ok "MCP server $name already configured — skipping"
       else
-        "$claude_bin" mcp add-json --scope user "$name" "$(jq -c --arg n "$name" '.[$n]' "$servers")" </dev/null
+        config_step claude mcp add-json --scope user "$name" "$(jq -c --arg n "$name" '.[$n]' "$servers")"
       fi
     done < <(jq -r 'keys[]' "$servers")
   fi
 }
 
+# PATH for this run is set up front in main(); this only persists it.
 ensure_path() {
-  [[ -d "$LOCAL_BIN" ]] || return 0
-  case ":${PATH}:" in
-    *":${LOCAL_BIN}:"*) return 0 ;;
-  esac
+  [[ -d "$LOCAL_BIN" && $LOCAL_BIN_WAS_ON_PATH -eq 0 ]] || return 0
 
   # shellcheck disable=SC2016  # written literally into the rc file, must not expand
   local line='export PATH="$HOME/.local/bin:$PATH"'
@@ -292,7 +337,6 @@ ensure_path() {
     printf '\n# added by install-dev-tools.sh\n%s\n' "$line" >> "$rc"
     log "Added ~/.local/bin to PATH in ${rc}"
   fi
-  export PATH="${LOCAL_BIN}:${PATH}"
 }
 
 verify() {
@@ -331,6 +375,14 @@ main() {
 
   [[ ${#requested[@]} -gt 0 ]] || requested=("${ALL_COMPONENTS[@]}")
 
+  # Put ~/.local/bin on PATH now, not at the end: claude-config needs the
+  # claude it just installed, and a re-run after a failed run must see the
+  # uv/claude that run already installed instead of reinstalling them.
+  case ":${PATH}:" in
+    *":${LOCAL_BIN}:"*) LOCAL_BIN_WAS_ON_PATH=1 ;;
+    *) LOCAL_BIN_WAS_ON_PATH=0; export PATH="${LOCAL_BIN}:${PATH}" ;;
+  esac
+
   preflight
 
   for c in "${requested[@]}"; do
@@ -359,6 +411,8 @@ Next steps (each needs an interactive login):
 
 Open a new shell (or: source ~/.bashrc) so PATH changes take effect.
 EOF
+
+  [[ $CONFIG_FAILURES -eq 0 ]] || die "${CONFIG_FAILURES} Claude Code config step(s) failed — see 'failed:' warnings above"
 }
 
 main "$@"

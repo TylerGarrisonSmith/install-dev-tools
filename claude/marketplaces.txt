@@ -1,0 +1,4 @@
+# Claude Code plugin marketplaces to add before installing plugins, one source
+# per line (owner/repo, git URL, or path). A fresh install only has the
+# built-in Anthropic directory, so marketplaces that plugins.txt uses go here.
+anthropics/claude-plugins-official

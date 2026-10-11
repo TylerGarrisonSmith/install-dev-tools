@@ -3,3 +3,6 @@
 # any clone, including Windows machines where autocrlf=true is the default.
 *.sh text eol=lf
 .gitattributes text eol=lf
+# Files under claude/ are copied verbatim into ~/.claude on Linux; keep them LF
+# so a Windows checkout doesn't ship CRLF into CLAUDE.md or settings.json.
+claude/** text eol=lf
